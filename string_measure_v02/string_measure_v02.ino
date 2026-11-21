@@ -5,10 +5,9 @@
 #include <BLE2901.h>
 
 #include <Arduino.h>
-#include <Wire.h>
+#include <HardwareSerial.h>
 
 #include "HX711.h"
-#include "TOF_Sense.h"
 
 #define SERVICE_UUID        "4e292be3-71e6-4ca1-a06e-b1b3660df15c"
 #define CHARACTERISTIC_UUID "d65ce50e-3baa-4405-b561-39980883f500"
@@ -18,8 +17,12 @@
 #define SCK 2
 
 #define MAX_DELAY 1000
-#define MIN_DELAY 1000
+#define MIN_DELAY 50
 
+#define TOF_RX 20   // сюда паяется TX датчика
+#define TOF_TX 21   // сюда паяется RX датчика
+
+HardwareSerial tof(1);
 HX711 scale;
 
 float calibration_factor = 1;
@@ -43,6 +46,10 @@ bool isFastMode = false;
 unsigned long lastWeightChangeTime = 0;
 float lastWeightValue = 0;
 bool isWeightFastMode = false;
+
+// Состояние TOF-датчика
+static unsigned long tofLastDis   = 0;   // последнее валидное расстояние, мм
+static unsigned long tofFrameTime = 0;   // когда пришёл последний кадр
 
 class MyCallbacks: public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic *pCharacteristic) {
@@ -118,8 +125,6 @@ void BLE_Start() {
                         BLECharacteristic::PROPERTY_NOTIFY
                       );
 
-  // ИСПРАВЛЕНО: стандартный CCCD без кастомных колбэков.
-  // Подписку будем проверять через pCharacteristic->getSubscribedCount().
   pCharacteristic->addDescriptor(new BLE2902());
 
   // Дескриптор с описанием (необязателен)
@@ -139,6 +144,36 @@ void BLE_Start() {
 
   BLEDevice::startAdvertising();
   Serial.println("📡 Реклама запущена. Имя устройства: Measuring PSS");
+}
+
+// ====== TOF датчик по UART (Waveshare TOF Laser Range Sensor Mini) ======
+
+unsigned long TOF_Read()
+{
+    // Выгребаем всё, что накопилось в буфере UART, и берём последний валидный кадр
+    while (tof.available() >= 16) {
+        if (tof.peek() != 0x57) { tof.read(); continue; }   // ищем заголовок
+
+        uint8_t frame[16];
+        tof.readBytes(frame, 16);
+
+        if (frame[1] != 0x00) continue;                     // не кадр измерений — пропускаем
+
+        uint8_t checksum = 0;
+        for (int i = 0; i < 15; i++) checksum += frame[i];
+        if (checksum != frame[15]) continue;                // битый кадр — пропускаем
+
+        uint8_t  status = frame[11];
+        uint32_t dis    = frame[8] | (frame[9] << 8) | ((uint32_t)frame[10] << 16);
+
+        tofLastDis   = (status == 1) ? dis : 0;
+        tofFrameTime = millis();
+    }
+
+    // Датчик молчит дольше секунды — считаем измерение недействительным
+    if (millis() - tofFrameTime > 1000) return 0;
+
+    return tofLastDis;
 }
 
 void setup() {
@@ -162,9 +197,10 @@ void setup() {
   scale.set_scale(calibration_factor);
   Serial.println(" ✓");
 
-  Serial.print("⚙️ Инициализация I2C (TOF датчик)...");
-  Wire.begin();
-  Wire.setClock(400000);
+  Serial.print("⚙️ Инициализация UART (TOF датчик)...");
+  tof.setRxBufferSize(4096);   // при задержке 1000 мс кадры не влезут в дефолтный буфер
+  tof.begin(921600, SERIAL_8N1, TOF_RX, TOF_TX);
+  delay(200);                  // ждём первый кадр
   Serial.println(" ✓");
 
   Serial.println("========================================");
@@ -173,17 +209,11 @@ void setup() {
   Serial.println("========================================");
 
   // Инициализация переменных для адаптивной задержки (расстояние)
-  TOF_Parameter initialTOF = TOF_Read();
-  lastDistanceValue = initialTOF.dis;
+  lastDistanceValue = TOF_Read();
   lastDistanceChangeTime = millis();
 
   // Инициализация переменных для адаптивной задержки (вес) — в граммах
-  float initialWeightSum = 0;
-  for (int i = 0; i < 5; i++) {
-    initialWeightSum += scale.get_units();
-    delay(10);
-  }
-  lastWeightValue = initialWeightSum / 5;
+  lastWeightValue = scale.get_units(5);   // среднее из 5 отсчётов HX711
   lastWeightChangeTime = millis();
 
   Serial.print("📊 Начальные значения: Вес = ");
@@ -194,44 +224,11 @@ void setup() {
   Serial.println("========================================");
 }
 
-TOF_Parameter TOF_Read()
-{
-    uint8_t read_buf[256];
-    TOF_Parameter TOF_0;
-
-    I2C_Read_Nbyte(0x00, read_buf, TOF_REGISTER_TOTAL_SIZE/2);
-    I2C_Read_Nbyte(TOF_REGISTER_TOTAL_SIZE/2, &read_buf[TOF_REGISTER_TOTAL_SIZE/2], TOF_REGISTER_TOTAL_SIZE/2);
-
-    TOF_0.interface_mode = read_buf[TOF_ADDR_MODE] & 0x07;
-    TOF_0.id = read_buf[TOF_ADDR_ID];
-
-    TOF_0.uart_baudrate = (unsigned long)(((unsigned long)read_buf[TOF_ADDR_UART_BAUDRATE + 3] << 24) | ((unsigned long)read_buf[TOF_ADDR_UART_BAUDRATE + 2] << 16) |
-                           ((unsigned long)read_buf[TOF_ADDR_UART_BAUDRATE + 1] << 8) | (unsigned long)read_buf[TOF_ADDR_UART_BAUDRATE]);
-
-    TOF_0.system_time = (unsigned long)(((unsigned long)read_buf[TOF_ADDR_SYSTEM_TIME + 3] << 24) | ((unsigned long)read_buf[TOF_ADDR_SYSTEM_TIME + 2] << 16) |
-                         ((unsigned long)read_buf[TOF_ADDR_SYSTEM_TIME + 1] << 8) | (unsigned long)read_buf[TOF_ADDR_SYSTEM_TIME]);
-
-    TOF_0.dis = (unsigned long)(((unsigned long)read_buf[TOF_ADDR_DIS + 3] << 24) | ((unsigned long)read_buf[TOF_ADDR_DIS + 2] << 16) |
-                 ((unsigned long)read_buf[TOF_ADDR_DIS + 1] << 8) | (unsigned long)read_buf[TOF_ADDR_DIS]);
-
-    TOF_0.dis_status = ((read_buf[TOF_ADDR_DIS_STATUS]) | (read_buf[TOF_ADDR_DIS_STATUS + 1] << 8));
-    TOF_0.signal_strength = ((read_buf[TOF_ADDR_SIGNAL_STRENGTH]) | (read_buf[TOF_ADDR_SIGNAL_STRENGTH + 1] << 8));
-    TOF_0.range_precision = read_buf[TOF_ADDR_RANGE_PRECISION];
-
-    return TOF_0;
-}
-
-// Вес в граммах
+// Вес в граммах + расстояние
 String getDataWithWeightAndDistance(unsigned long &distance, float &weight) {
-  float weightSum = 0;
-  for (int i = 0; i < 3; i++) {
-    weightSum += scale.get_units();
-    delay(10);
-  }
-  weight = weightSum / 3;
+  weight = scale.get_units(3);   // среднее из 3 отсчётов, библиотека сама ждёт готовность
 
-  TOF_Parameter TOF_0 = TOF_Read();
-  distance = TOF_0.dis;
+  distance = TOF_Read();
 
   return "{\"Weight\": " + String(weight) + ", \"Distance\": " + String(distance) + "}";
 }
@@ -304,25 +301,17 @@ int updateAdaptiveDelay(unsigned long currentDistance, float currentWeight,
 }
 
 String getData() {
-  for (int i = 0; i < 5; i ++) {
-    units = + scale.get_units(), 10;
-  }
-  units = units / 5;
+  units = scale.get_units(5);
 
-  TOF_Parameter TOF_0 = TOF_Read();
-  return "{\"Weight\": " + String(units) + ", \"Distance\": " + String(TOF_0.dis) + "}";
+  return "{\"Weight\": " + String(units) + ", \"Distance\": " + String(TOF_Read()) + "}";
 }
 
 String getDataWithDistance(unsigned long &distance) {
-  for (int i = 0; i < 3; i ++) {
-    units = + scale.get_units(), 10;
-  }
-  units = units / 3;
+  units = scale.get_units(3);
 
-  TOF_Parameter TOF_0 = TOF_Read();
-  distance = TOF_0.dis;
+  distance = TOF_Read();
 
-  return "{\"Weight\": " + String(units) + ", \"Distance\": " + String(TOF_0.dis) + "}";
+  return "{\"Weight\": " + String(units) + ", \"Distance\": " + String(distance) + "}";
 }
 
 void sendDataInChunks(String data) {
@@ -362,8 +351,6 @@ void loop() {
   );
 
   if (deviceConnected) {
-    // В Bluedroid нет getSubscribedCount().
-    // Просто вызываем notify() — если клиент не подписан, стек молча отбросит пакет.
     sendDataInChunks(dataToSend);
     sendCount++;
 
